@@ -1,0 +1,101 @@
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - project: 'templates/ci'
+    file: 'DockerInDockerTemplate.yml'
+
+
+variables:
+  VERSION: 1.0.${CI_PIPELINE_ID}
+  SAST_EXCLUDED_ANALYZERS: "gosec, nodejsscan"
+
+stages:
+   - build
+   - test
+   - release
+   - deploy
+
+
+build-backend-code-job:
+  stage: build
+  image: docker:20.10.12-dind-rootless
+  before_script:
+    - until docker info; do sleep 1; done
+    # переменные CI_REGISTRY_USER, CI_REGISTRY_PASSWORD, CI_REGISTRY генерятся Гитлабом, их задавать не надо 
+    - docker login -u ${DOCKER_USER} -p ${DOCKER_PASSWORD}
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:        
+    - cd backend
+    - >
+      docker build
+      --build-arg VERSION=$VERSION
+      --tag $CI_REGISTRY_IMAGE/pysy-backend:$CI_COMMIT_SHA
+      .
+    - docker push $CI_REGISTRY_IMAGE/pysy-backend:$CI_COMMIT_SHA
+
+spotbugs-sast:
+  stage: test
+
+
+sonarqube-frontend-sast:
+  stage: test
+  image: sonarsource/sonar-scanner-cli:latest
+  script:
+    - ls -la
+    - cd backend
+    - ls -la
+    - sonar-scanner -Dsonar.projectKey=${SONAR_PROJECT_BACKEND} -Dsonar.host.url=${SONARQUBE_URL} -Dsonar.sources=. -Dsonar.login=${SONAR_LOGIN}        
+  needs:
+     - build-backend-code-job   
+
+
+go-test:
+  stage: test
+  image: golang:1.17.13-bullseye
+  script:
+    - cd backend
+    - go test -v ./...     
+  needs:
+     - build-backend-code-job   
+
+upload-backend-release:
+  variables:
+    GIT_STRATEGY: none
+  image: docker:20.10.12-dind-rootless
+  stage: release
+  before_script:
+    - until docker info; do sleep 1; done
+    - docker login -u ${DOCKER_USER} -p ${DOCKER_PASSWORD}
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker pull $CI_REGISTRY_IMAGE/pysy-backend:$CI_COMMIT_SHA
+    # если образ прошел проверки в CI (сканирование, тесты и т.д), то тегаем latest
+    - docker tag $CI_REGISTRY_IMAGE/pysy-backend:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE/pysy-backend:$VERSION
+    - docker push $CI_REGISTRY_IMAGE/pysy-backend:$VERSION
+  needs:
+    - go-test
+  
+deploy:
+  stage: deploy
+  image: vault:1.11.3
+  when: manual
+  before_script:
+    #- 'command -v ssh-agent >/dev/null || ( apt-get update -y && apt-get install openssh-client -y )'
+    - apk add openssh-client bash
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - echo "$SSH_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  script:
+    - scp ./docker-compose.yml ${DEV_USER}@${DEV_HOST}:/home/${DEV_USER}/docker-compose.yml
+    - ssh ${DEV_USER}@${DEV_HOST}
+      "export "VERSION=${VERSION}";  
+       export "REGISTRY_USER=$CI_REGISTRY_USER";
+       export "REGISTRY_PASSWORD=$CI_REGISTRY_PASSWORD";
+       export "REGISTRY=$CI_REGISTRY";
+      /bin/bash -s " < ./backend/backend_deploy.sh 
+  needs:
+     - upload-backend-release  
+ 
+  
